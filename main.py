@@ -11,10 +11,38 @@ import asyncio
 import queue
 import posixpath
 import atexit
+import platform
 from http.server import HTTPServer, SimpleHTTPRequestHandler
-from packaging.version import parse as parse_version
 
-# --- KIỂM TRA THƯ VIỆN ---
+# --- 1. AUTO-INSTALL LIBRARIES (Colorama & Pymobiledevice3) ---
+def install_package(package):
+    print(f"[*] Auto-installing missing library: {package}...")
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+        print(f"[OK] Installed {package}. Restarting script...")
+        time.sleep(1)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    except Exception as e:
+        print(f"[Err] Installation failed: {e}")
+        print(f"Please run manually: pip install {package}")
+        sys.exit(1)
+
+# Check for Colorama (For UI)
+try:
+    from colorama import Fore, Style, init
+    init(autoreset=True)
+except ImportError:
+    install_package("colorama")
+
+# Check for Pymobiledevice3 (Core)
+try:
+    import pymobiledevice3
+    from packaging.version import parse as parse_version
+except ImportError as e:
+    missing_pkg = "pymobiledevice3" if "pymobiledevice3" in str(e) else "packaging"
+    install_package(missing_pkg)
+
+# --- IMPORTS AFTER INSTALLATION ---
 try:
     from pymobiledevice3 import usbmux
     from pymobiledevice3.lockdown import create_using_usbmux
@@ -24,12 +52,12 @@ try:
     from pymobiledevice3.services.dvt.dvt_secure_socket_proxy import DvtSecureSocketProxyService
     from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscoveryService
     from pymobiledevice3.exceptions import NoDeviceConnectedError
-except ImportError as e:
-    print(f"[Err] Missing lib: {e}", flush=True)
-    print("Run: pip install pymobiledevice3", flush=True)
-    sys.exit(1)
+except ImportError:
+    install_package("pymobiledevice3")
 
-# --- CẤU HÌNH ---
+# --- CONFIGURATION ---
+CURRENT_OS = platform.system()
+IS_WINDOWS = CURRENT_OS == 'Windows'
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOCAL_SOUNDS_DIR = os.path.join(SCRIPT_DIR, "Sounds")
 UUID_FILE = os.path.join(SCRIPT_DIR, "uuid.txt")
@@ -37,12 +65,23 @@ UUID_FILE = os.path.join(SCRIPT_DIR, "uuid.txt")
 TARGET_DISCLOSURE_PATH = "" 
 sd_file = "" 
 RESPRING_ENABLED = False
-
 audio_head_ok = threading.Event()
 audio_get_ok = threading.Event()
 info_queue = queue.Queue()
 
-# --- SERVER ---
+# --- UI HELPERS ---
+def print_banner():
+    banner = f"""
+    {Fore.BLUE}>>> Author: YangJiii - @duongduong0908{Style.RESET_ALL}
+    """
+    print(banner)
+
+def log_info(msg): print(f"{Fore.CYAN}[INFO] {msg}{Style.RESET_ALL}")
+def log_ok(msg): print(f"{Fore.GREEN}[SUCCESS] {msg}{Style.RESET_ALL}")
+def log_warn(msg): print(f"{Fore.YELLOW}[WARN] {msg}{Style.RESET_ALL}")
+def log_err(msg): print(f"{Fore.RED}[ERROR] {msg}{Style.RESET_ALL}")
+
+# --- SERVER HTTP ---
 class AudioRequestHandler(SimpleHTTPRequestHandler):
     def log_request(self, code='-', size='-'): 
         try:
@@ -58,41 +97,50 @@ class AudioRequestHandler(SimpleHTTPRequestHandler):
 
 def get_lan_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try: s.connect(("8.8.8.8", 80)); return s.getsockname()[0]
-    except: return "127.0.0.1"
-    finally: s.close()
+    s.settimeout(0.5)
+    try: 
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except: 
+        return "127.0.0.1"
+    finally: 
+        s.close()
 
 def start_http_server():
-    try:
-        handler = functools.partial(AudioRequestHandler)
-        httpd = HTTPServer(("0.0.0.0", 0), handler)
-        info_queue.put((get_lan_ip(), httpd.server_port))
-        httpd.serve_forever()
-    except Exception as e:
-        print(f"[Err] Server Error: {e}", flush=True)
+    retries = 3
+    for i in range(retries):
+        try:
+            handler = functools.partial(AudioRequestHandler)
+            httpd = HTTPServer(("0.0.0.0", 0), handler)
+            info_queue.put((get_lan_ip(), httpd.server_port))
+            httpd.serve_forever()
+            break
+        except Exception as e:
+            # log_warn(f"Server start attempt {i+1} failed: {e}. Retrying...")
+            time.sleep(1)
 
-# --- AUTO DETECT UDID ---
+# --- AUTO DETECT DEVICE ---
 def get_default_udid() -> str:
     try:
         devices = list(usbmux.list_devices())
     except Exception as e:
-        raise RuntimeError(f"Device list error: {e}")
+        raise RuntimeError(f"USB Error: {e}")
 
     if not devices:
-        raise NoDeviceConnectedError("No device found. Check cable & Trust.")
+        raise NoDeviceConnectedError("No device found. Check cable & press 'Trust' on iPhone.")
 
     usb_devices = [d for d in devices if getattr(d, "is_usb", False) or str(getattr(d, "connection_type", "")).upper() == "USB"]
     if not usb_devices:
         usb_devices = devices
 
     udid = usb_devices[0].serial
-    print(f"[*] Auto-detected Device: {udid}", flush=True)
+    log_info(f"Device Detected: {Fore.GREEN}{udid}")
     return udid
 
-# --- UUID LOGIC ---
+# --- FIND UUID (BOOKS APP) ---
 def wait_for_uuid_logic(service_provider):
-    print("[*] Searching for UUID...", flush=True)
-    print(" -> Please open BOOKS app and open/download a book.", flush=True)
+    log_info("Searching for UUID...")
+    print(f"{Fore.YELLOW} -> Please open the BOOKS app on your iPhone and open any book.{Style.RESET_ALL}")
     
     found_uuid = None
     start_time = time.time()
@@ -100,7 +148,7 @@ def wait_for_uuid_logic(service_provider):
     try:
         for syslog_entry in OsTraceService(lockdown=service_provider).syslog():
             if time.time() - start_time > 120: 
-                print("[!] UUID Timeout.", flush=True)
+                log_warn("UUID search timed out (120s).")
                 break
             
             if posixpath.basename(syslog_entry.filename) == 'bookassetd':
@@ -128,17 +176,22 @@ def main_callback(service_provider, dvt, uuid):
     audio_head_ok.clear()
     audio_get_ok.clear()
 
+    while not info_queue.empty():
+        try: info_queue.get_nowait()
+        except: pass
+
     t = threading.Thread(target=start_http_server, daemon=True)
     t.start()
+    
     try:
-        ip, port = info_queue.get(timeout=5)
-    except:
-        print("[Err] Cannot start server.", flush=True)
+        ip, port = info_queue.get(timeout=30)
+    except queue.Empty:
+        log_err("Server timeout: Could not start internal server (30s).")
         return False
 
     filename_only = os.path.basename(sd_file)
     audio_url = f"http://{ip}:{port}/{filename_only}"
-    print(f"[*] Server: {audio_url}", flush=True)
+    log_info(f"Local Server Running: {audio_url}")
 
     FILE_BL_TEMP = "working_BL.sqlite"
     FILE_DL_TEMP = "working_DL.sqlitedb"
@@ -162,7 +215,7 @@ def main_callback(service_provider, dvt, uuid):
             c.execute("UPDATE ZBLDOWNLOADINFO SET ZASSETPATH=?, ZPLISTPATH=?, ZDOWNLOADID=?", (TARGET_DISCLOSURE_PATH, TARGET_DISCLOSURE_PATH, TARGET_DISCLOSURE_PATH))
             c.execute("UPDATE ZBLDOWNLOADINFO SET ZURL=?", (audio_url,))
             bldb_conn.commit()
-    except Exception as e: print(f"[Err] DB BL: {e}")
+    except Exception as e: log_err(f"DB BL Error: {e}")
 
     try:
         with sqlite3.connect(FILE_DL_TEMP) as conn:
@@ -178,60 +231,63 @@ def main_callback(service_provider, dvt, uuid):
             c.execute(f"UPDATE asset SET url = '{server_p}-shm' WHERE url LIKE '%/BLDatabaseManager.sqlite-shm'")
             c.execute(f"UPDATE asset SET url = '{server_p}-wal' WHERE url LIKE '%/BLDatabaseManager.sqlite-wal'")
             conn.commit()
-    except Exception as e: print(f"[Err] DB DL: {e}")
+    except Exception as e: log_err(f"DB DL Error: {e}")
 
     afc = AfcService(lockdown=service_provider)
     pc = ProcessControl(dvt)
 
-    procs = OsTraceService(lockdown=service_provider).get_pid_list().get("Payload", {})
-    pid_book = next((pid for pid, p in procs.items() if p['ProcessName'] == 'bookassetd'), None)
-    pid_books = next((pid for pid, p in procs.items() if p['ProcessName'] == 'Books'), None)
-    
-    if pid_book: 
-        try: pc.signal(pid_book, 19)
-        except: pass
-    if pid_books: 
-        try: pc.kill(pid_books)
-        except: pass
+    try:
+        procs = OsTraceService(lockdown=service_provider).get_pid_list().get("Payload", {})
+        pid_book = next((pid for pid, p in procs.items() if p['ProcessName'] == 'bookassetd'), None)
+        pid_books = next((pid for pid, p in procs.items() if p['ProcessName'] == 'Books'), None)
+        
+        if pid_book: 
+            try: pc.signal(pid_book, 19)
+            except: pass
+        if pid_books: 
+            try: pc.kill(pid_books)
+            except: pass
+    except: pass
 
-    print(f"[*] Uploading...", flush=True)
+    log_info("Uploading data...")
     try:
         AfcService(lockdown=service_provider).push(sd_file, filename_only)
         afc.push(FILE_DL_TEMP, "Downloads/downloads.28.sqlitedb")
         afc.push(f"{FILE_DL_TEMP}-shm", "Downloads/downloads.28.sqlitedb-shm")
         afc.push(f"{FILE_DL_TEMP}-wal", "Downloads/downloads.28.sqlitedb-wal")
     except Exception as e:
-        print(f"[Warn] Upload fail: {e}", flush=True)
+        log_warn(f"Upload warning (ignorable): {e}")
 
-    pid_itunes = next((pid for pid, p in procs.items() if p['ProcessName'] == 'itunesstored'), None)
-    if pid_itunes: 
-        try: pc.kill(pid_itunes)
-        except: pass
+    try:
+        pid_itunes = next((pid for pid, p in procs.items() if p['ProcessName'] == 'itunesstored'), None)
+        if pid_itunes: 
+            try: pc.kill(pid_itunes)
+            except: pass
+    except: pass
 
     time.sleep(3)
     
-    pid_book = next((pid for pid, p in procs.items() if p['ProcessName'] == 'bookassetd'), None)
-    pid_books = next((pid for pid, p in procs.items() if p['ProcessName'] == 'Books'), None)
-    if pid_book: 
-        try: pc.kill(pid_book)
-        except: pass
-    if pid_books: 
-        try: pc.kill(pid_books)
-        except: pass
+    try:
+        current_procs = OsTraceService(lockdown=service_provider).get_pid_list().get("Payload", {})
+        pid_book = next((pid for pid, p in current_procs.items() if p['ProcessName'] == 'bookassetd'), None)
+        pid_books = next((pid for pid, p in current_procs.items() if p['ProcessName'] == 'Books'), None)
+        if pid_book: pc.kill(pid_book)
+        if pid_books: pc.kill(pid_books)
+    except: pass
 
     try: pc.launch("com.apple.iBooks")
     except: pass
 
-    print("[*] Waiting for device...", flush=True)
+    log_info("Waiting for device to download file (10-30s)...")
     start = time.time()
     success = False
     while True:
         if audio_get_ok.is_set():
-            print("[OK] Success!", flush=True)
+            log_ok("Success! File replaced.")
             success = True
             break
         if time.time() - start > 45:
-            print("[!] Timeout.", flush=True)
+            log_warn("Timeout waiting for file download.")
             success = False
             break
         time.sleep(0.1)
@@ -241,25 +297,17 @@ def main_callback(service_provider, dvt, uuid):
             AfcService(lockdown=service_provider).remove(filename_only)
     except: pass
 
-    # --- FIX RESPRING ---
     if RESPRING_ENABLED and success:
-        print("[*] Respringing...", flush=True)
+        log_info("Respringing...")
         try:
-            # Lấy danh sách PID mới nhất
             current_procs = OsTraceService(lockdown=service_provider).get_pid_list().get("Payload", {})
             sb_pid = next((pid for pid, p in current_procs.items() if p['ProcessName'] == 'SpringBoard'), None)
-            bb_pid = next((pid for pid, p in current_procs.items() if p['ProcessName'] == 'backboardd'), None)
             
             if sb_pid:
-                print(f" -> Killing SpringBoard (pid={sb_pid})...", flush=True)
                 pc.kill(sb_pid)
-            elif bb_pid:
-                print(f" -> Killing backboardd (pid={bb_pid})...", flush=True)
-                pc.kill(bb_pid)
             else:
-                print("[!] Could not find SpringBoard to kill.", flush=True)
-        except Exception as e:
-            print(f"[!] Respring failed: {e}", flush=True)
+                log_warn("SpringBoard PID not found.")
+        except: pass
     
     for f in [FILE_BL_TEMP, FILE_DL_TEMP, f"{FILE_DL_TEMP}-shm", f"{FILE_DL_TEMP}-wal"]:
         if os.path.exists(f): 
@@ -276,11 +324,16 @@ def exit_tunnel(process):
 async def create_tunnel(udid):
     cmd = [sys.executable, "-m", "pymobiledevice3", "lockdown", "start-tunnel", "--script-mode", "--udid", udid]
     
-    print("[*] Creating Tunnel (iOS 17+)...", flush=True)
+    if not IS_WINDOWS and os.geteuid() != 0:
+        log_info("Requesting sudo for Tunnel creation...")
+        cmd.insert(0, "sudo")
+    
+    log_info("Starting Tunnel (iOS 17+)...")
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     atexit.register(exit_tunnel, process)
     
-    while True:
+    start_time = time.time()
+    while time.time() - start_time < 30: 
         line = process.stdout.readline()
         if line: 
             decoded = line.decode().strip()
@@ -301,7 +354,7 @@ async def _run_async_rsd(address, port, uuid):
                 result = await loop.run_in_executor(None, lambda: run_blocking(rsd, uuid))
                 return result
         except Exception as e:
-            print(f"[Retry {i+1}/{max_retries}] Connect failed: {e}", flush=True)
+            log_warn(f"Tunnel Connection Retry {i+1}/{max_retries}: {e}")
     return False
 
 def run_blocking(rsd, uuid):
@@ -313,7 +366,7 @@ async def connection_context(udid):
         sp = create_using_usbmux(serial=udid)
         ver = parse_version(sp.product_version)
     except Exception as e:
-        print(f"[Err] Device connect error: {e}")
+        log_err(f"Connection Error: {e}")
         return False
     
     uuid = ""
@@ -327,44 +380,41 @@ async def connection_context(udid):
         uuid = wait_for_uuid_logic(sp)
         if uuid:
             with open(UUID_FILE, "w") as f: f.write(uuid)
-            print(f"[*] UUID saved: {uuid}", flush=True)
+            log_ok(f"UUID Saved: {uuid}")
         else:
-            print("[Error] UUID not found.", flush=True)
+            log_err("UUID not found.")
             return False
 
     if ver >= parse_version('17.0'):
         addr = await create_tunnel(udid)
         if addr:
-            print(f"[*] Tunnel Info: {addr['address']}:{addr['port']}")
             return await _run_async_rsd(addr["address"], addr["port"], uuid)
         else:
-            print("[Error] Tunnel creation failed.", flush=True)
+            log_err("Tunnel creation failed. Re-plug USB.")
             return False
     else:
         with DvtSecureSocketProxyService(lockdown=sp) as dvt: 
             return main_callback(sp, dvt, uuid)
 
-# --- MAIN ENTRY ---
 if __name__ == "__main__":
     os.chdir(SCRIPT_DIR)
-    
-    if os.name == 'nt':
+    print_banner()
+
+    if IS_WINDOWS:
         try:
             import ctypes
             if not ctypes.windll.shell32.IsUserAnAdmin():
-                print("--------------------------------------------------")
-                print("[Warning] Please Run as Administrator for best results!")
-                print("--------------------------------------------------")
+                print(f"{Fore.YELLOW}[WARN] Use 'Run as Administrator' for best results!{Style.RESET_ALL}")
         except: pass
 
     try:
         udid = get_default_udid()
     except Exception as e:
-        print(f"[Error] {e}", flush=True)
+        log_err(str(e))
         sys.exit(1)
 
     if not os.path.exists(LOCAL_SOUNDS_DIR):
-        print(f"[Error] Sounds folder not found: {LOCAL_SOUNDS_DIR}", flush=True)
+        log_err(f"Sounds folder not found: {LOCAL_SOUNDS_DIR}")
         sys.exit(1)
 
     tasks = [
@@ -385,7 +435,7 @@ if __name__ == "__main__":
         source_path = os.path.join(LOCAL_SOUNDS_DIR, fname)
         
         if not os.path.exists(source_path):
-            print(f"[Skip] File not found: {source_path}", flush=True)
+            log_warn(f"Source file not found (Skipping): {source_path}")
             continue
         
         temp_path = os.path.join(SCRIPT_DIR, fname)
@@ -400,27 +450,31 @@ if __name__ == "__main__":
             max_task_retries = 3
             task_success = False
             for i in range(max_task_retries):
-                print(f"\n=== Processing: {fname} (Attempt {i+1}/{max_task_retries}) ===", flush=True)
+                print(f"\n{Fore.BLUE}=== Processing: {fname} (Attempt {i+1}) ==={Style.RESET_ALL}")
                 try:
+                    if IS_WINDOWS:
+                        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+                    
                     loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(loop)
                     result = loop.run_until_complete(connection_context(udid))
                     loop.close()
+                    
                     if result:
                         task_success = True
                         break
                     else:
-                        print("[!] Failed. Retrying...", flush=True)
-                        time.sleep(2)
+                        log_warn("Failed. Retrying in 3s...")
+                        time.sleep(3)
                 except Exception as e:
-                    print(f"[Err] Error: {e}", flush=True)
+                    log_err(f"Exception: {e}")
             
             if not task_success:
-                print(f"[Fail] Could not replace {fname}.", flush=True)
+                log_err(f"Could not replace file: {fname}")
 
         finally:
             if os.path.exists(temp_path):
                 try: os.remove(temp_path)
                 except: pass
 
-    print("\n[Done] YangJiii - @duongduong0908", flush=True)
+    print(f"\n{Fore.MAGENTA}[Done] YangJiii - @duongduong0908{Style.RESET_ALL}")
